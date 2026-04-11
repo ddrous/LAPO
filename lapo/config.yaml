@@ -1,4 +1,4 @@
-env_name: bigfish
+env_name: moving_mnist
 exp_name: ~ # filled in by the launch.sh script (consistent across stages 1-3)
 stage_exp_name: ~ # updated in stages 1-3, used for wandb logging as a suffix
 
@@ -9,24 +9,28 @@ model:
   policy_impala_scale: 4
   vq:
     enabled: true
-    num_codebooks: 2
     num_discrete_latents: 4
     emb_dim: 16
+    num_codebooks: 2 
+    # num_codebooks: 1
     num_embs: 64 # each of the vq_latent_dim latents is a categorical variable with vq_num_embs values
+    # num_embs: 4096
     commitment_cost: 0.05
     decay: 0.999
 
 # stage-1 (latent idm & wm training) hyperparameters
 stage1:
   lr: 3e-4
-  bs: 128
-  steps: 50_000
+  bs: 32
+  # steps: 50_000
+  steps: 10000
 
 # stage-2 (latent behavior cloning) hyperparameters
 stage2:
   lr: 2e-4
-  bs: 128
-  steps: 60_000
+  bs: 32
+  # steps: 60_000
+  steps: 1000
 
 # stage-3 (rl-finetuning) hyperparameters
 stage3:

@@ -9,6 +9,7 @@ from rich.syntax import Syntax
 import torch
 import wandb
 
+# ADD_TIME_HORIZON = 1
 ADD_TIME_HORIZON = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

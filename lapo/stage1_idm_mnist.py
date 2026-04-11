@@ -6,7 +6,7 @@ sys.argv = [
     "stage1_idm.py", 
     # "env_name=bigfish", 
     "env_name=moving_mnist", 
-    "exp_name=my_notebook_run",
+    "exp_name=mnist_run",
 ]
 
 import config
@@ -14,8 +14,16 @@ import data_loader
 import doy
 import paths
 import torch
+import numpy as np
+from tensordict import TensorDict
 import utils
 from doy import loop
+
+
+## Fix the torch and numpy seeds
+torch.manual_seed(42)
+np.random.seed(42)
+
 
 #%%
 cfg = config.get()
@@ -26,9 +34,32 @@ run, logger = config.wandb_init("lapo_stage1", config.get_wandb_cfg(cfg))
 
 idm, wm = utils.create_dynamics_models(cfg.model)
 
-train_data, test_data = data_loader.load(cfg.env_name)
-train_iter = train_data.get_iter(cfg.stage1.bs)
-test_iter = test_data.get_iter(128)
+
+if cfg.env_name != "moving_mnist":
+    train_data, test_data = data_loader.load(cfg.env_name)
+    train_iter = train_data.get_iter(cfg.stage1.bs)
+    test_iter = test_data.get_iter(128)
+
+else:
+    from utils import MovingMNIST_LAPO_Stager
+
+    # --- Point this to your actual MovingMNIST .npy file path! ---
+    DATA_PATH = "/home/gb21553/Projects/Video-WARP/data/MovingMNIST/mnist_test_seq.npy" 
+
+    train_data = MovingMNIST_LAPO_Stager(DATA_PATH, is_test=False)
+    test_data = MovingMNIST_LAPO_Stager(DATA_PATH, is_test=True)
+
+    # Generate the infinite iterators used in the training loop
+    train_iter = train_data.get_iter(cfg.stage1.bs)
+    test_iter = test_data.get_iter(128)
+
+    print("MovingMNIST custom dataloaders ready!")
+
+
+
+
+
+
 
 opt, lr_sched = doy.LRScheduler.make(
     all=(
@@ -79,9 +110,10 @@ def test_step():
     wm_loss = wm.label(batch)
 
     # train latent -> true action decoder and evaluate its predictiveness
-    _, eval_metrics = utils.eval_latent_repr(train_data, idm)
+    # _, eval_metrics = utils.eval_latent_repr(train_data, idm)
 
-    logger(step, wm_loss_test=wm_loss, global_step=step * cfg.stage1.bs, **eval_metrics)
+    # logger(step, wm_loss_test=wm_loss, global_step=step * cfg.stage1.bs, **eval_metrics)
+    logger(step, wm_loss_test=wm_loss, global_step=step * cfg.stage1.bs)
 
 
 #%%
@@ -91,7 +123,8 @@ for step in loop(cfg.stage1.steps + 1, desc="[green bold](stage-1) Training IDM 
     if step % 500 == 0:
         test_step()
 
-    if step > 0 and (step % 5_000 == 0 or step == cfg.stage1.steps):
+    if step > 0 and (step % 5000 == 0 or step == cfg.stage1.steps):
+
         torch.save(
             dict(
                 **doy.get_state_dicts(wm=wm, idm=idm, opt=opt),
@@ -102,8 +135,16 @@ for step in loop(cfg.stage1.steps + 1, desc="[green bold](stage-1) Training IDM 
             paths.get_models_path(cfg.exp_name),
         )
 
+        # print(f"Saving model to:\n{paths.get_models_path(cfg.exp_name).absolute()}")
+
+
 
 #%%
+
+
+
+
+
 
 
 
@@ -310,3 +351,86 @@ try:
 except Exception as e:
     print("Could not fetch data from W&B. Are you logged in? Error:", e)
     print("Alternatively, you can just view the interactive charts at:", run.url if run else "W&B Dashboard")
+
+
+
+
+
+#%% Cell: 20-Frame Autoregressive Rollout Test
+
+# ---------------------------------------------------------
+# 1. Simplified 20-Frame DataLoader
+# ---------------------------------------------------------
+class MovingMNIST_Rollout_Stager:
+    def __init__(self, data_path):
+        print("Loading full 20-frame sequences from Test Set...")
+        raw_data = np.load(data_path)
+        # Transpose to (Sequences, Time, H, W) and take the test set
+        data = np.transpose(raw_data, (1, 0, 2, 3))[8000:]
+        # Add channel dim: (Num_Seqs, 20, 1, 64, 64)
+        self.data = np.expand_dims(data, axis=2) 
+        
+    def get_random_sequence(self, device=config.DEVICE):
+        idx = np.random.randint(len(self.data))
+        # Fetch 1 sequence, normalize to [-0.5, 0.5], add Batch dimension
+        seq_np = self.data[idx : idx+1].astype(np.float32) / 255.0 - 0.5
+        return torch.from_numpy(seq_np).to(device)
+
+DATA_PATH = "/home/gb21553/Projects/Video-WARP/data/MovingMNIST/mnist_test_seq.npy" 
+rollout_stager = MovingMNIST_Rollout_Stager(DATA_PATH)
+
+# ---------------------------------------------------------
+# 2. Autoregressive Generation Loop
+# ---------------------------------------------------------
+idm.eval()
+wm.eval()
+
+# Get a full 20-frame Ground Truth sequence (Shape: 1, 20, 1, 64, 64)
+gt_seq_tensor = rollout_stager.get_random_sequence()
+
+# Initialize our predicted video buffer with the first two Ground Truth frames (Context)
+pred_frames = [gt_seq_tensor[:, 0], gt_seq_tensor[:, 1]] # List of (1, 1, 64, 64)
+
+print("Running autoregressive generation...")
+with torch.no_grad():
+    # Loop from t=1 to t=18 (to predict frames t=2 to t=19)
+    for t in range(1, 19):
+        # A. Use IDM to extract the True Latent Action for this specific timestep
+        gt_context = gt_seq_tensor[:, t-1 : t+2] # 3-frame chunk
+        action_td, _, _ = idm(gt_context)
+        la_q = action_td["la_q"] # The quantized latent action
+        
+        # B. Predict the NEXT frame using the World Model
+        # CRITICAL: We feed the WM our *own past predictions*, not the ground truth!
+        wm_in = torch.stack(pred_frames[-2:], dim=1) # The last 2 predicted frames
+        pred_next = wm(wm_in, la_q) # Generates frame t+1
+        
+        # C. Append the newly generated frame to our buffer
+        pred_frames.append(pred_next)
+
+# ---------------------------------------------------------
+# 3. Format and Visualize
+# ---------------------------------------------------------
+# Stack the list of predicted frames into a single tensor (1, 20, 1, 64, 64)
+pred_seq_tensor = torch.stack(pred_frames, dim=1)
+
+# Move to CPU, change to (Time, Height, Width, Channels), and un-normalize
+gt_video = gt_seq_tensor[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5
+pred_video = pred_seq_tensor[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5
+
+# Clip strictly to [0.0, 1.0] to prevent matplotlib warnings
+gt_video = np.clip(gt_video, 0.0, 1.0)
+pred_video = np.clip(pred_video, 0.0, 1.0)
+
+print(f"Generated Video Shape: {pred_video.shape}")
+
+# Plot using your custom function!
+plot_videos(
+    video=pred_video, 
+    ref_video=gt_video, 
+    plot_ref=True, 
+    forecast_start=3, # Bolds the title at frame 3 to show where true generation begins
+    save_name="wandb/lapo_autoregressive_rollout.png", 
+    show_borders=True,
+    cmap='gray'
+)
