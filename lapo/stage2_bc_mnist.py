@@ -30,6 +30,8 @@ sns.set_style("whitegrid")
 torch.manual_seed(42)
 np.random.seed(42)
 
+TRAIN = False
+
 #%%
 
 print(paths.get_models_path(config.get().exp_name))
@@ -91,42 +93,50 @@ print("MovingMNIST custom dataloaders ready!")
 
 run, logger = config.wandb_init("lapo_stage2", config.get_wandb_cfg(cfg))
 
-for step in loop(
-    cfg.stage2.steps + 1, desc="[green bold](stage-2) Training latent policy via BC"
-):
-    lr_sched.step(step)
 
-    policy.train()
-    batch = next(train_iter)
-    idm.label(batch)
+if TRAIN:
+        
+    for step in loop(
+        cfg.stage2.steps + 1, desc="[green bold](stage-2) Training latent policy via BC"
+    ):
+        lr_sched.step(step)
 
-    preds = policy(batch["obs"][:, -2])  # the -2 selects last the pre-transition ob
-    loss = F.mse_loss(preds, batch["la"])
+        policy.train()
+        batch = next(train_iter)
+        idm.label(batch)
 
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+        preds = policy(batch["obs"][:, -2])  # the -2 selects last the pre-transition ob
+        loss = F.mse_loss(preds, batch["la"])
 
-    logger(
-        step=step,
-        loss=loss,
-        **lr_sched.get_state(),
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        logger(
+            step=step,
+            loss=loss,
+            **lr_sched.get_state(),
+        )
+
+        if step % 200 == 0:
+            policy.eval()
+            test_batch = next(test_iter)
+            idm.label(test_batch)
+            test_loss = F.mse_loss(policy(test_batch["obs"][:, -2]), test_batch["la"])
+            logger(step=step, test_loss=test_loss)
+
+    torch.save(
+        dict(policy=doy.state_dict_orig(policy), cfg=cfg, logger=logger),
+        paths.get_latent_policy_path(cfg.exp_name),
     )
 
-    if step % 200 == 0:
-        policy.eval()
-        test_batch = next(test_iter)
-        idm.label(test_batch)
-        test_loss = F.mse_loss(policy(test_batch["obs"][:, -2]), test_batch["la"])
-        logger(step=step, test_loss=test_loss)
 
-torch.save(
-    dict(policy=doy.state_dict_orig(policy), cfg=cfg, logger=logger),
-    paths.get_latent_policy_path(cfg.exp_name),
-)
-
-
-
+else:
+    # Load the trained policy for evaluation and visualization
+    state_dict = torch.load(paths.get_latent_policy_path(cfg.exp_name), weights_only=False) 
+    policy.load_state_dict(state_dict["policy"])
+    policy.eval()
+    print("Loaded trained latent policy for evaluation and visualization!")
 
 
 
@@ -364,3 +374,101 @@ plot_videos(
     save_name="wandb/lapo_alien_injection.png", 
     show_borders=True, cmap='gray'
 )
+
+
+
+
+
+
+
+
+
+
+#%% Cell 5: State Corruption & Morphing (PyTorch Adaptation)
+import os
+
+policy.eval()
+wm.eval()
+idm.eval()
+
+corrupt_seq_id = 54
+test_seq_id = 57
+
+print(f"\nGenerating morphing visualization for test sequence ID: {test_seq_id} corrupted by sequence ID: {corrupt_seq_id}")
+
+# 1. Fetch sequences
+seq_clean = rollout_stager.get_specific_sequence(test_seq_id)
+seq_corrupt = rollout_stager.get_specific_sequence(corrupt_seq_id)
+
+# In this architecture, state == recent frames. 
+# We grab the first frame of the corrupt sequence to act as our injection state.
+corrupt_frame = seq_corrupt[:, 0].clone()
+
+# Let's visualize the corrupt frame briefly
+plt.imshow(np.clip(corrupt_frame[0].cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1), cmap='gray')
+plt.title(f"Corrupting Frame (from Sequence {corrupt_seq_id})")
+plt.axis('off')
+plt.show()
+
+# 2. Define the Inference Rollout 
+def inference_rollout_morph(seq_ref, corrupt_frame_tensor=None, corrupt_step=-1):
+    # Bootstrap with exactly 2 frames
+    pred_frames = [seq_ref[:, 0], seq_ref[:, 1]]
+    
+    with torch.no_grad():
+        for t in range(1, 19): 
+            # --- STATE CORRUPTION INJECTION ---
+            # If we hit the corrupt step, override the most recent frame in the buffer
+            if t == corrupt_step and corrupt_frame_tensor is not None:
+                pred_frames[-1] = corrupt_frame_tensor.clone()
+            # ----------------------------------
+
+            wm_context = torch.stack([pred_frames[-2], pred_frames[-1]], dim=1)
+            la_continuous = policy(pred_frames[-1])
+            
+            # Quantize the action (vq returns a tuple: quantized, loss, perplexity, encodings)
+            vq_out = idm.vq(la_continuous)
+            la_quantized = vq_out[0] if isinstance(vq_out, tuple) else vq_out
+            
+            next_frame = wm(wm_context, la_quantized)
+            pred_frames.append(next_frame)
+
+    return torch.stack(pred_frames, dim=1)
+
+# 3. Generate both clean and corrupted rollouts (corrupting at t=5)
+pred_seq_clean = inference_rollout_morph(seq_clean, corrupt_frame_tensor=None)
+pred_seq_corrupt = inference_rollout_morph(seq_clean, corrupt_frame_tensor=corrupt_frame, corrupt_step=5)
+
+# 4. Format for plotting and saving (convert to numpy, shift from [-0.5, 0.5] to [0, 1])
+video_clean = np.clip(pred_seq_clean[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5, 0, 1)
+video_corrupt = np.clip(pred_seq_corrupt[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5, 0, 1)
+video_gt = np.clip(seq_clean[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5, 0, 1)
+frame_corrupt_np = np.clip(corrupt_frame[0].cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1)
+
+os.makedirs("wandb", exist_ok=True)
+os.makedirs("artefacts", exist_ok=True)
+
+# 5. Plot corrupted vs clean prediction
+plot_videos(
+    video=video_corrupt, 
+    ref_video=video_clean, # Display the clean run as the reference row
+    plot_ref=True,
+    forecast_start=2, # Marks where the autoregressive loop begins
+    save_name="wandb/lapo_corrupted_morph.png", 
+    show_borders=True, 
+    cmap='gray',
+    save_video=True,
+)
+
+# 6. Save all the frames, videos, etc., into an npz array for later use
+np.savez(
+    "artefacts/lapo_corrupt.npz", 
+    corrupt_pred_video=video_corrupt,
+    clean_pred_video=video_clean,
+    ref_video=video_gt,
+    corrupt_frame_ref=frame_corrupt_np
+)
+print("Artifacts successfully saved to artefacts/vwarp_corrupt.npz")
+
+# %%
+

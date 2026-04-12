@@ -4,3 +4,6 @@ lapo/wandb/*
 lapo/expert_data/*
 lapo/__pycache__/*
 lapo/exp_results/*
+
+
+*npz
