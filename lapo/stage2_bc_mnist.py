@@ -323,6 +323,20 @@ plot_videos(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #%% Cell 4: The Alien Injection Experiment
 
 policy.eval()
@@ -383,8 +397,8 @@ plot_videos(
 
 
 
-
 #%% Cell 5: State Corruption & Morphing (PyTorch Adaptation)
+
 import os
 
 policy.eval()
@@ -468,6 +482,108 @@ np.savez(
     ref_video=video_gt,
     corrupt_frame_ref=frame_corrupt_np
 )
+print("Artifacts successfully saved to artefacts/vwarp_corrupt.npz")
+
+# %%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#%% Cell 5: Long Horizon Forecasting Experiment
+
+import os
+
+policy.eval()
+wm.eval()
+idm.eval()
+
+test_seq_id = 54
+final_length = 1000
+
+print(f"\nGenerating morphing visualization for test sequence ID: {test_seq_id} corrupted by sequence ID: {corrupt_seq_id}")
+
+# 1. Fetch sequences
+seq_clean = rollout_stager.get_specific_sequence(test_seq_id)
+
+# Let's visualize the corrupt frame briefly
+plt.imshow(np.clip(corrupt_frame[0].cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1), cmap='gray')
+plt.title(f"Corrupting Frame (from Sequence {corrupt_seq_id})")
+plt.axis('off')
+plt.show()
+
+# 2. Define the Inference Rollout 
+def inference_rollout_morph(seq_ref, corrupt_frame_tensor=None, corrupt_step=-1):
+    # Bootstrap with exactly 2 frames
+    pred_frames = [seq_ref[:, 0], seq_ref[:, 1]]
+    
+    with torch.no_grad():
+        for t in range(1, final_length - 1):
+            wm_context = torch.stack([pred_frames[-2], pred_frames[-1]], dim=1)
+            la_continuous = policy(pred_frames[-1])
+            
+            # Quantize the action (vq returns a tuple: quantized, loss, perplexity, encodings)
+            vq_out = idm.vq(la_continuous)
+            la_quantized = vq_out[0] if isinstance(vq_out, tuple) else vq_out
+            
+            next_frame = wm(wm_context, la_quantized)
+            pred_frames.append(next_frame)
+
+    return torch.stack(pred_frames, dim=1)
+
+# 3. Generate both clean and corrupted rollouts (corrupting at t=5)
+pred_seq_clean = inference_rollout_morph(seq_clean, corrupt_frame_tensor=None)
+
+# 4. Format for plotting and saving (convert to numpy, shift from [-0.5, 0.5] to [0, 1])
+video_clean = np.clip(pred_seq_clean[0].cpu().numpy().transpose(0, 2, 3, 1) + 0.5, 0, 1)
+ref_video = np.zeros_like(video_clean)
+
+os.makedirs("wandb", exist_ok=True)
+os.makedirs("artefacts", exist_ok=True)
+
+# 5. Plot corrupted vs clean prediction
+plot_videos(
+    video=video_clean, 
+    ref_video=ref_video,
+    plot_ref=False,
+    forecast_start=3, # Marks where the autoregressive loop begins
+    save_name=f"wandb/lapo_clean_long_forecast_ID{test_seq_id}_T{final_length}.png", 
+    show_borders=True, 
+    cmap='gray',
+    save_video=True,
+)
+
+# 6. Save all the frames, videos, etc., into an npz array for later use
+np.save(f"artefacts/lapo_clean_long_forecast_ID{test_seq_id}_T{final_length}.npy", video_clean)
 print("Artifacts successfully saved to artefacts/vwarp_corrupt.npz")
 
 # %%

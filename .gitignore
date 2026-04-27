@@ -7,3 +7,4 @@ lapo/exp_results/*
 
 
 *npz
+*.npy
