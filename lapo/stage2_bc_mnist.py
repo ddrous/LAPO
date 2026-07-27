@@ -72,7 +72,7 @@ opt, lr_sched = doy.LRScheduler.make(
 from utils import MovingMNIST_LAPO_Stager
 
 # --- Point this to your actual MovingMNIST .npy file path! ---
-DATA_PATH = "/home/gb21553/Projects/Video-WARP/data/MovingMNIST/mnist_test_seq.npy" 
+DATA_PATH = "/home/ddrous/Projects/Video-WARP/data/MovingMNIST/mnist_test_seq.npy" 
 
 train_data = MovingMNIST_LAPO_Stager(DATA_PATH, is_test=False)
 test_data = MovingMNIST_LAPO_Stager(DATA_PATH, is_test=True)
@@ -588,3 +588,59 @@ print("Artifacts successfully saved to artefacts/vwarp_corrupt.npz")
 
 # %%
 
+## Traverse the test set and generate all the long-horizon sequences for the entire test set. Save the result as a sequence of shape (N_test, T_total, H, W, C) for later use in the paper or website. Save the ground thuth videos as well for comparison; these are shape (N_test, 20, H, W, C) and can be used to compute metrics like MSE, PSNR, SSIM, etc. for the long-horizon forecasts.
+
+# IN JAX, we used the code below; we want to generate something similar here.
+
+# long_horizon_videos = []
+# long_horizon_ground_truth = []
+
+# for batch_idx, batch_videos in enumerate(tqdm(test_loader, desc="Generating long-horizon forecasts for test set")):
+#     for seq_idx in range(batch_videos.shape[0]):
+#         input_video = batch_videos[seq_idx]
+#         input_video = jnp.concatenate([input_video, jnp.zeros((total_length - input_video.shape[0], H, W, C))], axis=0)
+#         output_video = inference_rollout_morph(model_final, input_video, coords_grid, 2/20)
+#         long_horizon_videos.append(output_video)
+
+#         long_horizon_ground_truth.append(batch_videos[seq_idx])
+
+#         # if seq_idx == 3:
+#         #     break
+
+#     if batch_idx == 0:
+#         break
+
+
+# print(f"\nShape of long-horizon videos: {np.array(long_horizon_videos).shape}")
+
+
+# np.savez(artefacts_path / f"naive_long_horizon_all_test_set_T{total_length}.npz",
+#          predictions=np.array(long_horizon_videos),
+#          ground_truth=np.array(long_horizon_ground_truth))
+
+
+long_horizon_videos = []
+long_horizon_ground_truth = []
+
+## We want to fecthc the first 256 sequences from the test set and generate long-horizon forecasts for each of them. We will save the results as a .npz file for later use in evaluation and visualization.
+
+for seq_id in range(256):
+    input_video = rollout_stager.get_specific_sequence(seq_id)
+    long_horizon_ground_truth.append(input_video.cpu().numpy())
+    
+    # Generate long-horizon forecast
+    pred_video = inference_rollout_morph(input_video, corrupt_frame_tensor=None)
+
+    ## This tensor has shape (1, final_length, 1, 64, 64). We want to convert it to (final_length, 64, 64, 1) and save it as a numpy array.
+
+    long_horizon_videos.append(pred_video[0].cpu().numpy().transpose(0, 2, 3, 1))
+
+    # if seq_id==1:
+    #     break
+
+
+print(f"\nShape of long-horizon videos: {np.array(long_horizon_videos).shape}")
+
+np.savez(f"artefacts/lapo_long_horizon_all_test_set_T{final_length}.npz",
+         predictions=np.array(long_horizon_videos),
+         ground_truth=np.array(long_horizon_ground_truth))
